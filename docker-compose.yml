@@ -1,0 +1,17 @@
+services:
+  # 静态 Web 应用；宿主端口默认 8080，可用 WEB_PORT 覆盖：
+  #   WEB_PORT=9000 docker compose up --build web
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+  # 一次性测试服务：运行 Vitest 与 Playwright 后退出。
+  #   docker compose run --build --rm verify
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    init: true

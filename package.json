@@ -1,0 +1,30 @@
+{
+  "name": "sterile-weighing-workbench",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "无菌配液称量工作台：纯前端（TypeScript + React + Vite），仅 IndexedDB 持久化，两阶段写入（预备记录 → 提交标记）",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "verify": "vitest run && playwright test"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.47.2",
+    "@types/node": "^26.5.1",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "fake-indexeddb": "^6.0.0",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.1"
+  }
+}

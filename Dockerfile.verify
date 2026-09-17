@@ -1,0 +1,8 @@
+# 一次性 verify 服务：运行 Vitest 单元测试与 Playwright 端到端测试。
+# 基础镜像已内置 Chromium 及其系统依赖，保证测试可复现。
+FROM mcr.microsoft.com/playwright:v1.47.2-jammy
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+CMD ["npm", "run", "verify"]
