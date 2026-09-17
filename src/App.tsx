@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Journal, SimulatedCrashError, type JournalSnapshot } from './persistence/journal';
+import {
+  Journal,
+  SimulatedCrashError,
+  StabilityRejectedError,
+  type JournalSnapshot,
+} from './persistence/journal';
 import { parseRecipeText, type Recipe, type RecipeError } from './domain/recipe';
 import { checkWeighingInput } from './domain/weighing';
 import ImportView from './ui/ImportView';
@@ -25,6 +30,7 @@ export default function App() {
   const [pendingRecipe, setPendingRecipe] = useState<Recipe | null>(null);
   const [importErrors, setImportErrors] = useState<RecipeError[]>([]);
   const [weighError, setWeighError] = useState<string | null>(null);
+  const [stabilityErrors, setStabilityErrors] = useState<string[] | null>(null);
   const [crashHook, setCrashHook] = useState<string | null>(null);
 
   // 启动：打开持久层并执行恢复；界面状态完全由恢复出的已提交前缀派生。
@@ -84,6 +90,7 @@ export default function App() {
     setSnapshot(journal.snapshot);
     setPendingRecipe(null);
     setWeighError(null);
+    setStabilityErrors(null);
     setView('batch');
   };
 
@@ -108,6 +115,28 @@ export default function App() {
         setView('crashed');
       } else {
         setWeighError(err instanceof Error ? err.message : String(err));
+      }
+    }
+  };
+
+  // 稳定读数确认：剂量完全由领域层依据读数重算，候选值无法被界面篡改；
+  // 不足 N 项 / 极差 / 趋势 / 剂量区间失败按顺序一次性反馈，且不写库。
+  const handleConfirmStable = async (readings: number[]) => {
+    if (!journal || !snapshot?.recipe) return;
+    const step = snapshot.recipe.steps[snapshot.applied.length];
+    if (!step || step.stability === undefined) return;
+    try {
+      await journal.confirmStable(readings);
+      setSnapshot(journal.snapshot);
+      setStabilityErrors(null);
+    } catch (err) {
+      if (err instanceof SimulatedCrashError) {
+        setCrashHook(err.hook);
+        setView('crashed');
+      } else if (err instanceof StabilityRejectedError) {
+        setStabilityErrors(err.reasons);
+      } else {
+        setStabilityErrors([err instanceof Error ? err.message : String(err)]);
       }
     }
   };
@@ -150,7 +179,9 @@ export default function App() {
           recipe={snapshot.recipe}
           applied={snapshot.applied}
           weighError={weighError}
+          stabilityErrors={stabilityErrors}
           onConfirm={handleConfirm}
+          onConfirmStable={handleConfirmStable}
         />
       )}
     </main>

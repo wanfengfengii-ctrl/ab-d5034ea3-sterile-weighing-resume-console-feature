@@ -1,5 +1,10 @@
 import { validateRecipe, type Recipe, type RecipeStep } from '../domain/recipe';
 import {
+  evaluateStability,
+  isSafeReading,
+  StabilityRejectedError,
+} from '../domain/stability';
+import {
   deletePrepareRecord,
   getAllCommits,
   getAllPrepares,
@@ -15,6 +20,7 @@ import { FaultInjector, SimulatedCrashError, type FaultHookKind } from './faults
 export type { PrepareRecord } from './db';
 export { SimulatedCrashError } from './faults';
 export type { FaultHookKind } from './faults';
+export { StabilityRejectedError } from '../domain/stability';
 
 /** 界面可见的日志快照；界面状态完全由 applied（已提交前缀）派生。 */
 export interface JournalSnapshot {
@@ -108,8 +114,9 @@ export class Journal {
   }
 
   /**
-   * 为当前步骤确认剂量。仅在提交标记写入成功后返回；
-   * 若故障钩子触发，抛出 SimulatedCrashError，此后本实例拒绝一切操作。
+   * 为当前步骤确认剂量（旧配方的单次称量路径）。仅当当前步骤**未**声明稳定
+   * 读数策略时可用；稳定步骤走此路径一律拒绝且不写库。仅在提交标记写入成功
+   * 后返回；故障钩子触发时抛 SimulatedCrashError，此后本实例拒绝一切操作。
    */
   async confirmExpected(doseMg: number): Promise<PrepareRecord> {
     this.ensureAlive();
@@ -120,14 +127,62 @@ export class Journal {
     if (!this.recipe || !step) {
       throw new Error('没有待确认的步骤');
     }
+    if (step.stability !== undefined) {
+      throw new Error('当前步骤要求稳定读数确认，单次称量路径不可用');
+    }
+    const record: PrepareRecord = {
+      seq: this.applied.length + 1,
+      stepId: step.id,
+      doseMg,
+    };
+    return this.commit(record);
+  }
+
+  /**
+   * 为声明稳定读数策略的当前步骤确认。剂量不由调用方给出，而由领域层依据
+   * 读数证据重新计算（篡改候选值无从注入）；readings 可长于 N，仅最后 N 项
+   * 参与判定。不足 N 项或极差、趋势、剂量区间任一失败均抛
+   * StabilityRejectedError（一次携带全部命中原因）且不写库。无策略的旧步骤
+   * 走此路径同样被拒绝。
+   */
+  async confirmStable(readings: number[]): Promise<PrepareRecord> {
+    this.ensureAlive();
+    if (this.inFlight) {
+      throw new Error('已有确认在进行中');
+    }
+    const step = this.currentStep;
+    if (!this.recipe || !step) {
+      throw new Error('没有待确认的步骤');
+    }
+    const policy = step.stability;
+    if (policy === undefined) {
+      throw new Error('当前步骤为单次称量步骤，稳定读数确认不可用');
+    }
+    if (!Array.isArray(readings) || !readings.every((r) => isSafeReading(r))) {
+      throw new Error('读数必须全部为非负安全整数毫克');
+    }
+
+    // 领域层重算：数量 → 极差 → 趋势 → 候选剂量区间。
+    const evaluation = evaluateStability(step, policy, readings);
+    if (!evaluation.ok || evaluation.candidateMg === null) {
+      throw new StabilityRejectedError(evaluation);
+    }
+
+    const record: PrepareRecord = {
+      seq: this.applied.length + 1,
+      stepId: step.id,
+      doseMg: evaluation.candidateMg,
+      // 保存所用读数证据（恰为最后 N 项），与剂量严格一致。
+      readings: evaluation.window,
+    };
+    return this.commit(record);
+  }
+
+  /** 两阶段写入；返回写入并应用后的记录。 */
+  private async commit(record: PrepareRecord): Promise<PrepareRecord> {
     this.inFlight = true;
     try {
-      const record: PrepareRecord = {
-        seq: this.applied.length + 1,
-        stepId: step.id,
-        doseMg,
-      };
-      // 第一次独立写入：预备记录（含步骤与剂量）。
+      // 第一次独立写入：预备记录（含步骤、剂量及读数证据）。
       await putPrepareRecord(this.db, record);
       this.runHook('afterPrepare');
       // 第二次独立写入：提交标记。
@@ -159,7 +214,9 @@ export class Journal {
  * 恢复流程：
  *  1. 删除无提交标记的悬空预备记录；
  *  2. 从序号 1 起，只重放预备记录与提交标记齐全的最长连续前缀；
- *  3. 防御：预备记录的步骤须与配方对应位置一致，否则停止重放。
+ *  3. 防御：预备记录的步骤须与配方对应位置一致，否则停止重放；
+ *  4. 防御：稳定步骤的读数证据须合法（恰 N 项非负安全整数），且由证据重算
+ *     的候选剂量与记录剂量一致、四项判定全部通过，否则停止重放。
  */
 async function recoverPrefix(db: IDBDatabase, recipe: Recipe | null): Promise<PrepareRecord[]> {
   const prepares = await getAllPrepares(db);
@@ -183,11 +240,29 @@ async function recoverPrefix(db: IDBDatabase, recipe: Recipe | null): Promise<Pr
   while (committedBySeq.has(seq)) {
     const record = committedBySeq.get(seq)!;
     const expectedStep = recipe?.steps[prefix.length];
-    if (expectedStep && record.stepId !== expectedStep.id) {
+    if (expectedStep && !recordMatchesStep(record, expectedStep)) {
       break;
     }
     prefix.push(record);
     seq += 1;
   }
   return prefix;
+}
+
+/**
+ * 校验一条已提交预备记录与配方对应步骤一致：
+ * 步骤编号一致；稳定步骤须带读数证据，证据合法、判定通过且重算剂量等于记录
+ * 剂量；单次称量步骤不得携带读数证据。
+ */
+function recordMatchesStep(record: PrepareRecord, step: RecipeStep): boolean {
+  if (record.stepId !== step.id) return false;
+  const policy = step.stability;
+  if (policy === undefined) {
+    return record.readings === undefined;
+  }
+  const readings = record.readings;
+  if (!Array.isArray(readings) || readings.length !== policy.samples) return false;
+  if (!readings.every((r) => isSafeReading(r))) return false;
+  const evaluation = evaluateStability(step, policy, readings);
+  return evaluation.ok && evaluation.candidateMg === record.doseMg;
 }

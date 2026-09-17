@@ -4,7 +4,15 @@ import type { RecipeError } from '../domain/recipe';
 const SAMPLE_RECIPE = {
   steps: [
     { id: 'NaCl-500', barcode: 'BC-NACL-01', targetMg: 500, toleranceMg: 10 },
-    { id: 'KCl-200', barcode: 'BC-KCL-02', targetMg: 200, toleranceMg: 0 },
+    {
+      id: 'KCl-200',
+      barcode: 'BC-KCL-02',
+      targetMg: 200,
+      toleranceMg: 0,
+      samples: 5,
+      maxRangeMg: 4,
+      maxDriftMg: 1,
+    },
     { id: 'GLU-1000', barcode: 'BC-GLU-03', targetMg: 1000, toleranceMg: 1000 },
   ],
 };
@@ -22,7 +30,9 @@ export default function ImportView({ errors, onImport }: Props) {
       <h2>导入配方</h2>
       <p className="hint">
         粘贴配方 JSON：1–30 个有序步骤；编号为唯一非空 ASCII 字符串，条码为非空 ASCII
-        字符串，目标量为至少 1 的整数毫克，容差为 0 至目标量的整数。
+        字符串，目标量为至少 1 的整数毫克，容差为 0 至目标量的整数。可选稳定读数策略：
+        同时声明 samples（3–9 的整数采样数）、maxRangeMg（非负安全整数最大极差）、
+        maxDriftMg（非负安全整数每次采样最大漂移）；三者缺省即按单次称量。
       </p>
       <textarea
         data-testid="recipe-input"

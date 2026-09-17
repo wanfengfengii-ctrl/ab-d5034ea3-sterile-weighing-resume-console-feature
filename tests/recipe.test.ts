@@ -6,6 +6,9 @@ interface StepOverrides {
   barcode?: unknown;
   targetMg?: unknown;
   toleranceMg?: unknown;
+  samples?: unknown;
+  maxRangeMg?: unknown;
+  maxDriftMg?: unknown;
 }
 
 function step(over: StepOverrides = {}) {
@@ -165,5 +168,87 @@ describe('配方校验', () => {
     expect(result.errors[0].stepIndex).toBeNull();
     expect(result.errors[1].stepIndex).toBe(5);
     expect(errors[0].stepIndex).toBe(0);
+  });
+
+  it('缺省策略的旧配方步骤不含 stability 字段', () => {
+    const { recipe } = validateRecipe({ steps: [step()] });
+    expect(recipe?.steps[0].stability).toBeUndefined();
+  });
+
+  it('接受合法的稳定读数策略（含 samples 边界 3 与 9）', () => {
+    for (const samples of [3, 9]) {
+      const { recipe, errors } = validateRecipe({
+        steps: [step({ samples, maxRangeMg: 0, maxDriftMg: 0 })],
+      });
+      expect(errors).toEqual([]);
+      expect(recipe?.steps[0].stability).toEqual({ samples, maxRangeMg: 0, maxDriftMg: 0 });
+    }
+    // 较大的非负安全整数合法
+    expect(
+      validateRecipe({
+        steps: [
+          step({ samples: 5, maxRangeMg: Number.MAX_SAFE_INTEGER, maxDriftMg: 123456 }),
+        ],
+      }).errors,
+    ).toEqual([]);
+  });
+
+  it('samples 须为 3 至 9 的整数', () => {
+    for (const samples of [2, 10, 0, -3, 3.5, '5', null, undefined]) {
+      const over: StepOverrides = { samples, maxRangeMg: 1, maxDriftMg: 1 };
+      const { errors } = validateRecipe({ steps: [step(over)] });
+      expect(errors.some((e) => e.field === 'samples')).toBe(true);
+    }
+  });
+
+  it('maxRangeMg 与 maxDriftMg 须为非负安全整数', () => {
+    for (const bad of [-1, 1.5, '5', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null]) {
+      expect(
+        validateRecipe({
+          steps: [step({ samples: 3, maxRangeMg: bad, maxDriftMg: 1 })],
+        }).errors.some((e) => e.field === 'maxRangeMg'),
+      ).toBe(true);
+      expect(
+        validateRecipe({
+          steps: [step({ samples: 3, maxRangeMg: 1, maxDriftMg: bad })],
+        }).errors.some((e) => e.field === 'maxDriftMg'),
+      ).toBe(true);
+    }
+  });
+
+  it('策略三字段部分声明时，缺少的字段各自报错', () => {
+    // 仅 samples
+    let result = validateRecipe({ steps: [step({ samples: 3 })] });
+    expect(result.recipe).toBeNull();
+    expect(result.errors.map((e) => e.field)).toEqual(['maxRangeMg', 'maxDriftMg']);
+
+    // 仅 maxRangeMg
+    result = validateRecipe({ steps: [step({ maxRangeMg: 2 })] });
+    expect(result.errors.map((e) => e.field)).toEqual(['samples', 'maxDriftMg']);
+
+    // samples 与 maxDriftMg，缺 maxRangeMg
+    result = validateRecipe({ steps: [step({ samples: 4, maxDriftMg: 2 })] });
+    expect(result.errors.map((e) => e.field)).toEqual(['maxRangeMg']);
+  });
+
+  it('策略字段全部非法时三个错误一并返回', () => {
+    const { errors } = validateRecipe({
+      steps: [step({ samples: 2, maxRangeMg: -1, maxDriftMg: 1.2 })],
+    });
+    expect(errors.map((e) => e.field)).toEqual(['samples', 'maxRangeMg', 'maxDriftMg']);
+  });
+
+  it('策略非法不影响其它步骤，合法步骤仍可解析出策略', () => {
+    const { recipe, errors } = validateRecipe({
+      steps: [
+        step({ id: 'OK', samples: 3, maxRangeMg: 5, maxDriftMg: 1 }),
+        step({ id: 'BAD', samples: 3 }),
+      ],
+    });
+    expect(recipe).toBeNull();
+    expect(errors.map((e) => `${e.stepIndex}:${e.field}`)).toEqual([
+      '1:maxRangeMg',
+      '1:maxDriftMg',
+    ]);
   });
 });

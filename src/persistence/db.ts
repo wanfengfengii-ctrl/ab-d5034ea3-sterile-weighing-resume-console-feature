@@ -14,11 +14,17 @@ export const STORE_META = 'meta';
 export const STORE_PREPARES = 'prepares';
 export const STORE_COMMITS = 'commits';
 
-/** 预备记录：含步骤与剂量，序号递增。 */
+/**
+ * 预备记录：含步骤与剂量，序号递增。
+ * 稳定读数步骤另存 readings：参与判定的最后 N 项读数证据（长度恰为采样数 N），
+ * doseMg 必须与由 readings 重算的候选剂量一致；旧配方的单次称量步骤无此字段。
+ */
 export interface PrepareRecord {
   seq: number;
   stepId: string;
   doseMg: number;
+  /** 仅稳定读数步骤存在：所用读数证据（毫克，非负安全整数）。 */
+  readings?: number[];
 }
 
 /** 提交标记：仅有序号；存在即表示对应预备记录已生效。 */

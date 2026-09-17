@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { applyRecordOnce, Journal, SimulatedCrashError } from '../src/persistence/journal';
+import {
+  applyRecordOnce,
+  Journal,
+  SimulatedCrashError,
+  StabilityRejectedError,
+} from '../src/persistence/journal';
 import {
   deleteDatabase,
   getAllCommits,
@@ -15,6 +20,20 @@ import type { Recipe } from '../src/domain/recipe';
 const RECIPE: Recipe = {
   steps: [
     { id: 'A', barcode: 'BC-A', targetMg: 100, toleranceMg: 10 },
+    { id: 'B', barcode: 'BC-B', targetMg: 50, toleranceMg: 0 },
+  ],
+};
+
+// 步骤 A 为稳定读数步骤：N=5，极差 ≤4，漂移 ≤1；步骤 B 为旧单次称量。
+const STABLE_RECIPE: Recipe = {
+  steps: [
+    {
+      id: 'A',
+      barcode: 'BC-A',
+      targetMg: 100,
+      toleranceMg: 5,
+      stability: { samples: 5, maxRangeMg: 4, maxDriftMg: 1 },
+    },
     { id: 'B', barcode: 'BC-B', targetMg: 50, toleranceMg: 0 },
   ],
 };
@@ -197,5 +216,219 @@ describe('applyRecordOnce', () => {
     expect(s3.map((r) => r.seq)).toEqual([1, 2]);
     const s4 = applyRecordOnce(s3, { seq: 2, stepId: 'B', doseMg: 50 });
     expect(s4).toBe(s3);
+  });
+});
+
+describe('稳定读数确认', () => {
+  it('稳定窗口确认：领域层重算剂量，预备记录保存读数证据', async () => {
+    const j = await open();
+    await j.startBatch(STABLE_RECIPE);
+    const rec = await j.confirmStable([100, 101, 102, 103, 104]);
+    expect(rec).toEqual({
+      seq: 1,
+      stepId: 'A',
+      doseMg: 102,
+      readings: [100, 101, 102, 103, 104],
+    });
+    expect(j.currentStep?.id).toBe('B');
+
+    const db = await openDatabase();
+    try {
+      expect(await getAllPrepares(db)).toEqual([
+        { seq: 1, stepId: 'A', doseMg: 102, readings: [100, 101, 102, 103, 104] },
+      ]);
+      expect(await getAllCommits(db)).toEqual([{ seq: 1 }]);
+    } finally {
+      db.close();
+    }
+
+    // 后续旧步骤走单次称量路径
+    const rec2 = await j.confirmExpected(50);
+    expect(rec2).toEqual({ seq: 2, stepId: 'B', doseMg: 50 });
+    expect(j.isComplete).toBe(true);
+  });
+
+  it('稳定步骤只采用最后 N 项，前置多余读数不影响结果', async () => {
+    const j = await open();
+    await j.startBatch(STABLE_RECIPE);
+    const rec = await j.confirmStable([0, 999, 100, 100, 100, 100, 100]);
+    expect(rec.doseMg).toBe(100);
+    expect(rec.readings).toEqual([100, 100, 100, 100, 100]);
+  });
+
+  it('稳定步骤禁止走旧单次称量路径，且不写库', async () => {
+    const j = await open();
+    await j.startBatch(STABLE_RECIPE);
+    await expect(j.confirmExpected(100)).rejects.toThrow('稳定读数确认');
+    expect(j.snapshot.applied).toEqual([]);
+    const db = await openDatabase();
+    try {
+      expect(await getAllPrepares(db)).toEqual([]);
+      expect(await getAllCommits(db)).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('旧单次称量步骤禁止走稳定确认路径', async () => {
+    const j = await open();
+    await j.startBatch(RECIPE);
+    await expect(j.confirmStable([100, 100, 100, 100, 100])).rejects.toThrow('单次称量');
+  });
+
+  it('不足 N 项 / 极差 / 趋势 / 剂量区间失败按顺序同时反馈，且不写库', async () => {
+    const j = await open();
+    await j.startBatch(STABLE_RECIPE);
+
+    // 不足 N 项
+    let err: unknown;
+    try {
+      await j.confirmStable([100, 100, 100]);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(StabilityRejectedError);
+    expect((err as StabilityRejectedError).failures).toEqual(['count']);
+
+    // 极差与趋势同时超差且候选越界：顺序 range → trend → doseRange
+    try {
+      await j.confirmStable([120, 122, 124, 126, 128]);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as StabilityRejectedError).failures).toEqual(['range', 'trend', 'doseRange']);
+
+    // 仅极差超差
+    try {
+      await j.confirmStable([100, 100, 100, 100, 105]);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as StabilityRejectedError).failures).toEqual(['range']);
+
+    // 全部失败期间步骤与日志不变、无任何写入
+    expect(j.snapshot.applied).toEqual([]);
+    expect(j.currentStep?.id).toBe('A');
+    const db = await openDatabase();
+    try {
+      expect(await getAllPrepares(db)).toEqual([]);
+      expect(await getAllCommits(db)).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('非法读数数组被拒绝且不写库', async () => {
+    const j = await open();
+    await j.startBatch(STABLE_RECIPE);
+    await expect(j.confirmStable([100, -1, 100, 100, 100])).rejects.toThrow('非负安全整数');
+    await expect(
+      j.confirmStable([100, 1.5, 100, 100, 100] as unknown as number[]),
+    ).rejects.toThrow('非负安全整数');
+    expect(j.snapshot.applied).toEqual([]);
+  });
+
+  it('稳定确认的 afterPrepare 崩溃：悬空记录（含证据）被删除，可重新确认', async () => {
+    const j1 = await open();
+    await j1.startBatch(STABLE_RECIPE);
+    j1.armFault('afterPrepare');
+    await expect(j1.confirmStable([100, 101, 102, 103, 104])).rejects.toBeInstanceOf(
+      SimulatedCrashError,
+    );
+
+    const j2 = await open();
+    expect(j2.snapshot.applied).toEqual([]);
+    expect(j2.currentStep?.id).toBe('A');
+    const db = await openDatabase();
+    try {
+      expect(await getAllPrepares(db)).toEqual([]);
+      expect(await getAllCommits(db)).toEqual([]);
+    } finally {
+      db.close();
+    }
+
+    const rec = await j2.confirmStable([100, 100, 100, 100, 100]);
+    expect(rec).toEqual({
+      seq: 1,
+      stepId: 'A',
+      doseMg: 100,
+      readings: [100, 100, 100, 100, 100],
+    });
+  });
+
+  it('稳定确认的 afterCommit 崩溃：已提交记录仅重放一次，读数证据与剂量一致', async () => {
+    const j1 = await open();
+    await j1.startBatch(STABLE_RECIPE);
+    j1.armFault('afterCommit');
+    await expect(j1.confirmStable([100, 101, 102, 103, 104])).rejects.toBeInstanceOf(
+      SimulatedCrashError,
+    );
+
+    const j2 = await open();
+    expect(j2.snapshot.applied).toEqual([
+      { seq: 1, stepId: 'A', doseMg: 102, readings: [100, 101, 102, 103, 104] },
+    ]);
+    expect(j2.currentStep?.id).toBe('B');
+
+    // 再开一次：同一已提交记录不得被重复应用
+    const j3 = await open();
+    openJournals.push(j3);
+    expect(j3.snapshot.applied).toHaveLength(1);
+  });
+
+  it('恢复时篡改已提交记录的候选剂量：证据与剂量不一致则停止重放', async () => {
+    const db = await openDatabase();
+    await putMeta(db, 'recipe', STABLE_RECIPE);
+    // readings 重算候选为 102，但记录剂量被改为 999
+    await putPrepareRecord(db, {
+      seq: 1,
+      stepId: 'A',
+      doseMg: 999,
+      readings: [100, 101, 102, 103, 104],
+    });
+    await putCommitMarker(db, 1);
+    db.close();
+
+    const j = await open();
+    expect(j.snapshot.applied).toEqual([]);
+    expect(j.currentStep?.id).toBe('A');
+  });
+
+  it('恢复时读数证据缺失、数量不符或判定失败：停止重放', async () => {
+    async function seed(record: Record<string, unknown>) {
+      const db = await openDatabase();
+      await putMeta(db, 'recipe', STABLE_RECIPE);
+      await putPrepareRecord(db, record as never);
+      await putCommitMarker(db, 1);
+      db.close();
+    }
+
+    await seed({ seq: 1, stepId: 'A', doseMg: 102 }); // 缺 readings
+    let j = await open();
+    expect(j.snapshot.applied).toEqual([]);
+    j.close();
+    await deleteDatabase();
+
+    await seed({ seq: 1, stepId: 'A', doseMg: 100, readings: [100, 100, 100] }); // 仅 3 项
+    j = await open();
+    expect(j.snapshot.applied).toEqual([]);
+    j.close();
+    await deleteDatabase();
+
+    // 证据本身极差超差：判定不通过
+    await seed({ seq: 1, stepId: 'A', doseMg: 100, readings: [100, 100, 100, 100, 105] });
+    j = await open();
+    expect(j.snapshot.applied).toEqual([]);
+    j.close();
+    await deleteDatabase();
+
+    // 单次称量步骤记录携带 readings：不一致
+    const db = await openDatabase();
+    await putMeta(db, 'recipe', RECIPE);
+    await putPrepareRecord(db, { seq: 1, stepId: 'A', doseMg: 100, readings: [100] });
+    await putCommitMarker(db, 1);
+    db.close();
+    j = await open();
+    expect(j.snapshot.applied).toEqual([]);
   });
 });

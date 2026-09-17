@@ -38,14 +38,28 @@
 | `barcode` | 非空 ASCII 字符串 |
 | `targetMg` | 至少 1 的整数毫克 |
 | `toleranceMg` | 0 至目标量的整数 |
+| `samples` | 可选，稳定读数采样数 N：3 至 9 的整数 |
+| `maxRangeMg` | 可选，窗口读数最大极差：非负安全整数毫克 |
+| `maxDriftMg` | 可选，每次采样最大漂移：非负安全整数毫克 |
+
+三个稳定策略字段**要么全部缺省（旧配方，单次称量），要么同时声明**；任一出现即视为声明策略，非法（部分声明、越界、类型错误）并入同一份配方错误清单。
 
 校验**一次返回全部错误**，并按步骤输入位置**稳定排序**（全局错误在前）；存在任何错误时批次不得开始。批次开始后配方不可替换。
 
 ### 称量规则
 
-界面仅接受**当前步骤**的条码与整数称量值：条码**完全一致**且数值落在
-`[targetMg − toleranceMg, targetMg + toleranceMg]` **闭区间**才可确认；
-失败时步骤与日志均不改变（不产生任何写入）。
+- **单次称量步骤**（未声明策略的旧配方）：界面仅接受**当前步骤**的条码与整数称量值：条码**完全一致**且数值落在 `[targetMg − toleranceMg, targetMg + toleranceMg]` **闭区间**才可确认；失败时步骤与日志均不改变（不产生任何写入）。
+- **稳定读数步骤**（声明策略）：操作员先扫描当前原料条码，再**逐个录入**非负安全整数毫克读数；非法读数不进入窗口，界面仅保留**最后 N 项**。收满 N 项后显示极差、趋势与候选剂量并允许确认。
+
+稳定判定一律采用 `x = 0 … N−1` 的最后 N 项，全部乘加使用 **BigInt**：
+
+1. 数量：窗口须收满 N 项；
+2. 极差：`max − min ≤ maxRangeMg`；
+3. 趋势（最小二乘斜率绝对值）：
+   `|N·Σxy − Σx·Σy| ≤ maxDriftMg × [N·Σx² − (Σx)²]`；
+4. 候选剂量：读数升序排序后**两中位项之和整除 2**（偶数窗口即双中位项均值向下取整），且须落入步骤闭区间。
+
+确认时**剂量由领域层依据读数证据重新计算**，界面无法注入候选值；不足 N 项、极差、趋势、剂量区间失败按此顺序**一次性同时反馈**且不写库；稳定步骤调用旧单次确认路径（或反之）一律拒绝。预备记录保存所用读数（恰为最后 N 项）与候选剂量，恢复时重算证据，证据缺失、数量不符、判定失败或剂量与证据不一致都会停止重放。
 
 ## 本地运行
 
@@ -69,10 +83,11 @@ docker compose run --build --rm verify
 
 ```
 src/
-  domain/       recipe.ts（配方校验）、weighing.ts（称量输入校验）
-  persistence/  db.ts（IndexedDB 原语）、journal.ts（两阶段写入与恢复）、faults.ts（故障钩子）
-  ui/           ImportView / PreviewView / BatchView
+  domain/       recipe.ts（配方校验，含可选稳定策略）、weighing.ts（单次称量校验）、
+                stability.ts（稳定读数：最后 N 项、极差、BigInt 趋势、两中位项候选剂量）
+  persistence/  db.ts（IndexedDB 原语）、journal.ts（两阶段写入、稳定确认领域重算与恢复）、faults.ts（故障钩子）
+  ui/           ImportView / PreviewView / BatchView（单次与稳定读数两种称量面板）
 tests/
-  recipe.test.ts、weighing.test.ts、journal.test.ts（Vitest + fake-indexeddb）
-  e2e/workbench.spec.ts（Playwright，含 afterPrepare / afterCommit 崩溃恢复复现）
+  recipe.test.ts、weighing.test.ts、stability.test.ts、journal.test.ts（Vitest + fake-indexeddb）
+  e2e/workbench.spec.ts、stability.spec.ts（Playwright，含 afterPrepare / afterCommit 崩溃恢复复现）
 ```

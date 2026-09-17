@@ -11,16 +11,36 @@
  *  - 条码：非空 ASCII 字符串；
  *  - 目标量：至少 1 的整数毫克；
  *  - 容差：0 至目标量的整数。
+ *  - 可选稳定读数策略（samples / maxRangeMg / maxDriftMg 三个字段须同时声明）：
+ *      采样数 samples：3 至 9 的整数；
+ *      最大极差 maxRangeMg：非负安全整数毫克；
+ *      每次采样最大漂移 maxDriftMg：非负安全整数毫克。
+ *    三个字段全部缺省即旧配方，按单次称量流程；任一字段出现即视为声明策略，
+ *    非法（含部分声明、越界、类型错误）并入配方错误清单。
  * 校验一次返回全部错误，并按步骤输入位置稳定排序（全局错误排在最前）。
  */
 
 export const MAX_STEPS = 30;
+export const MIN_SAMPLES = 3;
+export const MAX_SAMPLES = 9;
+
+/** 稳定读数策略：N 次采样、最大极差与每次采样最大漂移。 */
+export interface StabilityPolicy {
+  /** 采样数（窗口大小），3 至 9 的整数。 */
+  samples: number;
+  /** 窗口读数最大极差，非负安全整数毫克。 */
+  maxRangeMg: number;
+  /** 每次采样最大漂移（最小二乘斜率限值），非负安全整数毫克。 */
+  maxDriftMg: number;
+}
 
 export interface RecipeStep {
   id: string;
   barcode: string;
   targetMg: number;
   toleranceMg: number;
+  /** 缺省表示旧配方的单次称量步骤。 */
+  stability?: StabilityPolicy;
 }
 
 export interface Recipe {
@@ -31,7 +51,15 @@ export interface RecipeError {
   /** 步骤在输入中的位置（0 起）；null 表示与具体步骤无关的全局错误。 */
   stepIndex: number | null;
   /** 出错字段；null 表示整条步骤或整体结构错误。 */
-  field: 'id' | 'barcode' | 'targetMg' | 'toleranceMg' | null;
+  field:
+    | 'id'
+    | 'barcode'
+    | 'targetMg'
+    | 'toleranceMg'
+    | 'samples'
+    | 'maxRangeMg'
+    | 'maxDriftMg'
+    | null;
   message: string;
 }
 
@@ -49,6 +77,11 @@ function isNonEmptyAscii(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 非负安全整数（Number.isSafeInteger 且 >= 0）。 */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** 解析配方 JSON 文本；解析失败返回单个全局错误。 */
@@ -162,8 +195,81 @@ export function validateRecipe(data: unknown): ValidationResult {
       toleranceMg = toleranceRaw;
     }
 
+    // 可选稳定读数策略：三个字段任一出现即视为声明策略，三者必须同时合法。
+    const hasSamples = raw.samples !== undefined;
+    const hasRange = raw.maxRangeMg !== undefined;
+    const hasDrift = raw.maxDriftMg !== undefined;
+    const stabilityDeclared = hasSamples || hasRange || hasDrift;
+    let stability: StabilityPolicy | null = null;
+    if (stabilityDeclared) {
+      let samples: number | null = null;
+      let maxRangeMg: number | null = null;
+      let maxDriftMg: number | null = null;
+
+      if (!hasSamples) {
+        errors.push({
+          stepIndex: index,
+          field: 'samples',
+          message: `步骤 ${at}：稳定读数策略须同时声明 samples、maxRangeMg、maxDriftMg，缺少 samples`,
+        });
+      } else if (
+        typeof raw.samples !== 'number' ||
+        !Number.isInteger(raw.samples) ||
+        raw.samples < MIN_SAMPLES ||
+        raw.samples > MAX_SAMPLES
+      ) {
+        errors.push({
+          stepIndex: index,
+          field: 'samples',
+          message: `步骤 ${at}：samples 须为 ${MIN_SAMPLES} 至 ${MAX_SAMPLES} 的整数`,
+        });
+      } else {
+        samples = raw.samples;
+      }
+
+      if (!hasRange) {
+        errors.push({
+          stepIndex: index,
+          field: 'maxRangeMg',
+          message: `步骤 ${at}：稳定读数策略须同时声明 samples、maxRangeMg、maxDriftMg，缺少 maxRangeMg`,
+        });
+      } else if (!isNonNegativeSafeInteger(raw.maxRangeMg)) {
+        errors.push({
+          stepIndex: index,
+          field: 'maxRangeMg',
+          message: `步骤 ${at}：maxRangeMg 须为非负安全整数毫克`,
+        });
+      } else {
+        maxRangeMg = raw.maxRangeMg;
+      }
+
+      if (!hasDrift) {
+        errors.push({
+          stepIndex: index,
+          field: 'maxDriftMg',
+          message: `步骤 ${at}：稳定读数策略须同时声明 samples、maxRangeMg、maxDriftMg，缺少 maxDriftMg`,
+        });
+      } else if (!isNonNegativeSafeInteger(raw.maxDriftMg)) {
+        errors.push({
+          stepIndex: index,
+          field: 'maxDriftMg',
+          message: `步骤 ${at}：maxDriftMg 须为非负安全整数毫克`,
+        });
+      } else {
+        maxDriftMg = raw.maxDriftMg;
+      }
+
+      if (samples !== null && maxRangeMg !== null && maxDriftMg !== null) {
+        stability = { samples, maxRangeMg, maxDriftMg };
+      }
+    }
+
     if (id !== null && barcode !== null && targetMg !== null && toleranceMg !== null) {
-      steps.push({ id, barcode, targetMg, toleranceMg });
+      steps.push(
+        stability !== null
+          ? { id, barcode, targetMg, toleranceMg, stability }
+          : { id, barcode, targetMg, toleranceMg },
+      );
     }
   });
 

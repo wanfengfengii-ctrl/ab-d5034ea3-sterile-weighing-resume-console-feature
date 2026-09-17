@@ -17,6 +17,7 @@ export default function PreviewView({ recipe, onStart, onBack }: Props) {
             <th>编号</th>
             <th>目标量</th>
             <th>容差</th>
+            <th>稳定读数策略</th>
           </tr>
         </thead>
         <tbody>
@@ -26,6 +27,11 @@ export default function PreviewView({ recipe, onStart, onBack }: Props) {
               <td>{s.id}</td>
               <td>{s.targetMg} mg</td>
               <td>±{s.toleranceMg} mg</td>
+              <td data-testid={`preview-stability-${i}`}>
+                {s.stability
+                  ? `N=${s.stability.samples}，极差≤${s.stability.maxRangeMg}，漂移≤${s.stability.maxDriftMg}`
+                  : '单次称量'}
+              </td>
             </tr>
           ))}
         </tbody>
