@@ -1,7 +1,17 @@
 import { useEffect, useState } from 'react';
-import { Journal, SimulatedCrashError, type JournalSnapshot } from './persistence/journal';
+import {
+  Journal,
+  SimulatedCrashError,
+  StableConfirmationRejectedError,
+  type JournalSnapshot,
+} from './persistence/journal';
 import { parseRecipeText, type Recipe, type RecipeError } from './domain/recipe';
 import { checkWeighingInput } from './domain/weighing';
+import {
+  describeStableFailure,
+  evaluateReadings,
+  isValidReadingSequence,
+} from './domain/stable';
 import ImportView from './ui/ImportView';
 import PreviewView from './ui/PreviewView';
 import BatchView from './ui/BatchView';
@@ -25,6 +35,7 @@ export default function App() {
   const [pendingRecipe, setPendingRecipe] = useState<Recipe | null>(null);
   const [importErrors, setImportErrors] = useState<RecipeError[]>([]);
   const [weighError, setWeighError] = useState<string | null>(null);
+  const [stableErrors, setStableErrors] = useState<string[] | null>(null);
   const [crashHook, setCrashHook] = useState<string | null>(null);
 
   // 启动：打开持久层并执行恢复；界面状态完全由恢复出的已提交前缀派生。
@@ -84,11 +95,12 @@ export default function App() {
     setSnapshot(journal.snapshot);
     setPendingRecipe(null);
     setWeighError(null);
+    setStableErrors(null);
     setView('batch');
   };
 
-  // 确认：先本地校验（失败时步骤与日志均不改变），再走两阶段写入；
-  // 提交标记成功后才更新界面。
+  // 单次称量确认（未声明 stable 的旧流程）：先本地校验（失败时步骤与日志均不改变），
+  // 再走两阶段写入；提交标记成功后才更新界面。
   const handleConfirm = async (barcodeInput: string, doseInput: string) => {
     if (!journal || !snapshot?.recipe) return;
     const step = snapshot.recipe.steps[snapshot.applied.length];
@@ -112,6 +124,49 @@ export default function App() {
     }
   };
 
+  // 稳定读数确认：条码须为当前原料；候选剂量完全由领域层依据读数重算，
+  // 调用方不提供剂量。不足 N 项、极差、趋势、剂量区间失败按固定顺序
+  // 同时反馈，且不产生任何写入。
+  const handleConfirmStable = async (barcodeInput: string, readings: number[]) => {
+    if (!journal || !snapshot?.recipe) return;
+    const step = snapshot.recipe.steps[snapshot.applied.length];
+    if (!step || !step.stable) return;
+    if (barcodeInput !== step.barcode) {
+      setStableErrors(['条码与当前原料不一致，请扫描当前步骤的原料条码']);
+      return;
+    }
+    if (!isValidReadingSequence(readings)) {
+      setStableErrors(['读数证据非法：每项须为非负安全整数毫克']);
+      return;
+    }
+    try {
+      await journal.confirmStable(readings);
+      setSnapshot(journal.snapshot);
+      setStableErrors(null);
+    } catch (err) {
+      if (err instanceof SimulatedCrashError) {
+        setCrashHook(err.hook);
+        setView('crashed');
+        return;
+      }
+      if (err instanceof StableConfirmationRejectedError) {
+        // 重新计算失败明细，按领域层固定顺序给出实际值/配置值；
+        // 证据本身非法时无法重算，仅展示拒绝原因。
+        if (!isValidReadingSequence(err.readings)) {
+          setStableErrors([err.message]);
+          return;
+        }
+        const detail = evaluateReadings(step, err.readings);
+        const messages = detail.ok
+          ? [err.message]
+          : detail.failures.map((kind) => describeStableFailure(kind, step, detail));
+        setStableErrors(messages);
+        return;
+      }
+      setStableErrors([err instanceof Error ? err.message : String(err)]);
+    }
+  };
+
   return (
     <main>
       <header className="app-header">
@@ -123,7 +178,9 @@ export default function App() {
 
       {view === 'crashed' && (
         <section data-testid="crash-banner" className="crash-banner" role="alert">
-          <h2>模拟崩溃{crashHook ? `（${crashHook} 钩子）` : ''}</h2>
+          <h2>
+            模拟崩溃{crashHook ? `（${crashHook} 钩子）` : ''}
+          </h2>
           <p>故障钩子触发，进程已立即终止；本次确认未反映到界面。</p>
           <p>
             刷新页面后，恢复流程会删除无提交标记的悬空预备记录，并从序号 1
@@ -150,7 +207,10 @@ export default function App() {
           recipe={snapshot.recipe}
           applied={snapshot.applied}
           weighError={weighError}
+          stableErrors={stableErrors}
           onConfirm={handleConfirm}
+          onConfirmStable={handleConfirmStable}
+          onClearStableErrors={() => setStableErrors(null)}
         />
       )}
     </main>

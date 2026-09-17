@@ -13,6 +13,10 @@ export default defineConfig({
   use: {
     baseURL: 'http://127.0.0.1:4173',
     trace: 'retain-on-failure',
+    // 受限容器（无沙箱权限）中可设置 PLAYWRIGHT_NO_SANDBOX=1；默认行为不变。
+    launchOptions: process.env.PLAYWRIGHT_NO_SANDBOX
+      ? { args: ['--no-sandbox', '--disable-dev-shm-usage'] }
+      : undefined,
   },
   webServer: {
     command: 'npm run build && npm run preview -- --host 127.0.0.1 --port 4173 --strictPort',

@@ -1,5 +1,10 @@
 import { validateRecipe, type Recipe, type RecipeStep } from '../domain/recipe';
 import {
+  evaluateReadings,
+  isValidReadingSequence,
+  type StableFailureKind,
+} from '../domain/stable';
+import {
   deletePrepareRecord,
   getAllCommits,
   getAllPrepares,
@@ -20,6 +25,19 @@ export type { FaultHookKind } from './faults';
 export interface JournalSnapshot {
   recipe: Recipe | null;
   applied: PrepareRecord[];
+}
+
+/** 稳定步骤确认未通过领域判定；不会产生任何写入，步骤与日志均不变。 */
+export class StableConfirmationRejectedError extends Error {
+  readonly failures: StableFailureKind[];
+  readonly readings: number[];
+
+  constructor(failures: StableFailureKind[], readings: number[]) {
+    super(`稳定读数确认被拒绝：${failures.join('、')}`);
+    this.name = 'StableConfirmationRejectedError';
+    this.failures = failures;
+    this.readings = readings;
+  }
 }
 
 /**
@@ -120,6 +138,10 @@ export class Journal {
     if (!this.recipe || !step) {
       throw new Error('没有待确认的步骤');
     }
+    if (step.stable) {
+      // 稳定读数步骤不得走单次称量旧路径：必须由 confirmStable 重新计算。
+      throw new Error('当前步骤要求稳定读数确认，请使用稳定读数窗口提交');
+    }
     this.inFlight = true;
     try {
       const record: PrepareRecord = {
@@ -134,6 +156,56 @@ export class Journal {
       await putCommitMarker(this.db, record.seq);
       this.runHook('afterCommit');
       // 标记成功后才应用记录（界面由调用方据此更新）。
+      this.applied = applyRecordOnce(this.applied, record);
+      return record;
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * 为配置了稳定读数策略的当前步骤确认：候选剂量不由调用方提供，
+   * 而由领域层依据 readings 重新计算；不足 N 项或极差、趋势、剂量区间
+   * 失败按固定顺序同时反馈，抛出 StableConfirmationRejectedError，
+   * 不执行任何写入。直接调用旧路径 confirmExpected 处理稳定步骤同样被拒绝。
+   */
+  async confirmStable(readings: number[]): Promise<PrepareRecord> {
+    this.ensureAlive();
+    if (this.inFlight) {
+      throw new Error('已有确认在进行中');
+    }
+    const step = this.currentStep;
+    if (!this.recipe || !step) {
+      throw new Error('没有待确认的步骤');
+    }
+    if (!step.stable) {
+      // 稳定确认路径只能用于配置了策略的步骤；单次步骤仍走旧路径。
+      throw new Error('当前步骤未配置稳定读数策略');
+    }
+    // 证据形式复查：非法读数（含非整数、负数、非数字、非数组）一律拒绝且不写库。
+    if (!isValidReadingSequence(readings)) {
+      throw new Error('读数证据非法：每项须为非负安全整数毫克');
+    }
+
+    const result = evaluateReadings(step, readings);
+    if (!result.ok) {
+      throw new StableConfirmationRejectedError(result.failures, result.readings);
+    }
+
+    this.inFlight = true;
+    try {
+      const record: PrepareRecord = {
+        seq: this.applied.length + 1,
+        stepId: step.id,
+        // 剂量为领域层重算结果，调用方无法注入。
+        doseMg: result.doseMg,
+        // 预备记录保存所用读数证据，与候选剂量一致。
+        stableReadings: result.readings,
+      };
+      await putPrepareRecord(this.db, record);
+      this.runHook('afterPrepare');
+      await putCommitMarker(this.db, record.seq);
+      this.runHook('afterCommit');
       this.applied = applyRecordOnce(this.applied, record);
       return record;
     } finally {
@@ -186,8 +258,26 @@ async function recoverPrefix(db: IDBDatabase, recipe: Recipe | null): Promise<Pr
     if (expectedStep && record.stepId !== expectedStep.id) {
       break;
     }
+    // 证据一致性：稳定步骤的预备记录须保存所用读数，且候选剂量必须
+    // 能由该证据原样重算；单次步骤不得携带读数证据。任一不符视为
+    // 被篡改的记录，停止重放且不应用。
+    if (expectedStep && !recordEvidenceConsistent(expectedStep, record)) {
+      break;
+    }
     prefix.push(record);
     seq += 1;
   }
   return prefix;
+}
+
+/** 恢复时校验预备记录的读数证据与剂量是否与配方步骤一致。 */
+function recordEvidenceConsistent(step: RecipeStep, record: PrepareRecord): boolean {
+  if (step.stable) {
+    if (!isValidReadingSequence(record.stableReadings)) {
+      return false;
+    }
+    const result = evaluateReadings(step, record.stableReadings);
+    return result.ok && result.doseMg === record.doseMg;
+  }
+  return record.stableReadings === undefined;
 }

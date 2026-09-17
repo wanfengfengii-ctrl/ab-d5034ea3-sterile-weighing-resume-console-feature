@@ -11,16 +11,34 @@
  *  - 条码：非空 ASCII 字符串；
  *  - 目标量：至少 1 的整数毫克；
  *  - 容差：0 至目标量的整数。
+ *  - 可选稳定读数策略 stable：声明后该步骤按多次采样确认，
+ *    samples 为 3 至 9 的整数采样数，maxRangeMg（最大极差）与
+ *    maxDrift（每次采样最大漂移，mg/次）均为非负安全整数；
+ *    未声明 stable 的步骤仍按原有单次称量流程执行。
  * 校验一次返回全部错误，并按步骤输入位置稳定排序（全局错误排在最前）。
  */
 
 export const MAX_STEPS = 30;
+export const MIN_SAMPLES = 3;
+export const MAX_SAMPLES = 9;
+
+/** 稳定读数策略：收满 samples 项读数后按极差与趋势判定，候选剂量落入闭区间方可确认。 */
+export interface StableStrategy {
+  /** 采样数：3 至 9 的整数。 */
+  samples: number;
+  /** 最大极差（mg）：非负安全整数。 */
+  maxRangeMg: number;
+  /** 每次采样最大漂移（mg/次）：非负安全整数。 */
+  maxDrift: number;
+}
 
 export interface RecipeStep {
   id: string;
   barcode: string;
   targetMg: number;
   toleranceMg: number;
+  /** 未声明（undefined）时按单次称量流程；声明后按稳定读数流程。 */
+  stable?: StableStrategy;
 }
 
 export interface Recipe {
@@ -31,7 +49,16 @@ export interface RecipeError {
   /** 步骤在输入中的位置（0 起）；null 表示与具体步骤无关的全局错误。 */
   stepIndex: number | null;
   /** 出错字段；null 表示整条步骤或整体结构错误。 */
-  field: 'id' | 'barcode' | 'targetMg' | 'toleranceMg' | null;
+  field:
+    | 'id'
+    | 'barcode'
+    | 'targetMg'
+    | 'toleranceMg'
+    | 'stable'
+    | 'samples'
+    | 'maxRangeMg'
+    | 'maxDrift'
+    | null;
   message: string;
 }
 
@@ -49,6 +76,11 @@ function isNonEmptyAscii(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 非负安全整数（Number.isSafeInteger 且 ≥ 0）。 */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** 解析配方 JSON 文本；解析失败返回单个全局错误。 */
@@ -162,8 +194,65 @@ export function validateRecipe(data: unknown): ValidationResult {
       toleranceMg = toleranceRaw;
     }
 
+    // 可选稳定读数策略：未声明（缺省或 null）即按单次称量流程；
+    // 一旦声明，samples/maxRangeMg/maxDrift 全部校验，错误并入本步骤错误清单。
+    let stable: StableStrategy | null = null;
+    if (raw.stable !== undefined && raw.stable !== null) {
+      if (!isRecord(raw.stable)) {
+        errors.push({
+          stepIndex: index,
+          field: 'stable',
+          message: `步骤 ${at}：稳定策略 stable 须为对象`,
+        });
+      } else {
+        const cfg = raw.stable as Record<string, unknown>;
+        let samples: number | null = null;
+        let maxRangeMg: number | null = null;
+        let maxDrift: number | null = null;
+
+        if (
+          typeof cfg.samples !== 'number' ||
+          !Number.isSafeInteger(cfg.samples) ||
+          cfg.samples < MIN_SAMPLES ||
+          cfg.samples > MAX_SAMPLES
+        ) {
+          errors.push({
+            stepIndex: index,
+            field: 'samples',
+            message: `步骤 ${at}：采样数须为 ${MIN_SAMPLES} 至 ${MAX_SAMPLES} 的整数`,
+          });
+        } else {
+          samples = cfg.samples;
+        }
+
+        if (!isNonNegativeSafeInteger(cfg.maxRangeMg)) {
+          errors.push({
+            stepIndex: index,
+            field: 'maxRangeMg',
+            message: `步骤 ${at}：最大极差须为非负安全整数`,
+          });
+        } else {
+          maxRangeMg = cfg.maxRangeMg;
+        }
+
+        if (!isNonNegativeSafeInteger(cfg.maxDrift)) {
+          errors.push({
+            stepIndex: index,
+            field: 'maxDrift',
+            message: `步骤 ${at}：每次采样最大漂移须为非负安全整数`,
+          });
+        } else {
+          maxDrift = cfg.maxDrift;
+        }
+
+        if (samples !== null && maxRangeMg !== null && maxDrift !== null) {
+          stable = { samples, maxRangeMg, maxDrift };
+        }
+      }
+    }
+
     if (id !== null && barcode !== null && targetMg !== null && toleranceMg !== null) {
-      steps.push({ id, barcode, targetMg, toleranceMg });
+      steps.push({ id, barcode, targetMg, toleranceMg, ...(stable ? { stable } : {}) });
     }
   });
 

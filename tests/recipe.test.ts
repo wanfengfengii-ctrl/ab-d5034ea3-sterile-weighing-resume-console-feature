@@ -6,6 +6,7 @@ interface StepOverrides {
   barcode?: unknown;
   targetMg?: unknown;
   toleranceMg?: unknown;
+  stable?: unknown;
 }
 
 function step(over: StepOverrides = {}) {
@@ -165,5 +166,89 @@ describe('配方校验', () => {
     expect(result.errors[0].stepIndex).toBeNull();
     expect(result.errors[1].stepIndex).toBe(5);
     expect(errors[0].stepIndex).toBe(0);
+  });
+
+  describe('稳定读数策略', () => {
+    const validStable = { samples: 4, maxRangeMg: 5, maxDrift: 1 };
+
+    it('未声明 stable 的旧配方不新增字段', () => {
+      const { recipe } = validateRecipe({ steps: [step()] });
+      expect(recipe?.steps[0].stable).toBeUndefined();
+    });
+
+    it('接受合法稳定策略（含边界 3、9 与零值极差/漂移）', () => {
+      for (const samples of [3, 9]) {
+        const { recipe, errors } = validateRecipe({
+          steps: [step({ stable: { samples, maxRangeMg: 0, maxDrift: 0 } })],
+        });
+        expect(errors).toEqual([]);
+        expect(recipe?.steps[0].stable).toEqual({ samples, maxRangeMg: 0, maxDrift: 0 });
+      }
+      expect(
+        validateRecipe({ steps: [step({ stable: { ...validStable, maxRangeMg: 2 ** 53 - 1 } })] })
+          .errors,
+      ).toEqual([]);
+    });
+
+    it('显式 null 的 stable 视为未声明（旧流程）', () => {
+      const { recipe, errors } = validateRecipe({ steps: [step({ stable: null })] });
+      expect(errors).toEqual([]);
+      expect(recipe?.steps[0].stable).toBeUndefined();
+    });
+
+    it('stable 不是对象时报 stable 结构错误', () => {
+      for (const stable of ['x', 5, []]) {
+        const { errors } = validateRecipe({ steps: [step({ stable })] });
+        expect(errors.map((e) => e.field)).toContain('stable');
+      }
+    });
+
+    it('samples 须为 3 至 9 的整数', () => {
+      for (const samples of [2, 10, 0, -1, 4.5, '4', null, undefined, NaN, Infinity]) {
+        const { errors } = validateRecipe({
+          steps: [step({ stable: { ...validStable, samples } })],
+        });
+        expect(errors.some((e) => e.field === 'samples'), `samples=${String(samples)}`).toBe(true);
+      }
+    });
+
+    it('maxRangeMg 与 maxDrift 须为非负安全整数', () => {
+      for (const bad of [-1, 0.5, '0', null, undefined, NaN, Infinity, 2 ** 53]) {
+        expect(
+          validateRecipe({
+            steps: [step({ stable: { ...validStable, maxRangeMg: bad } })],
+          }).errors.some((e) => e.field === 'maxRangeMg'),
+          `maxRangeMg=${String(bad)}`,
+        ).toBe(true);
+        expect(
+          validateRecipe({
+            steps: [step({ stable: { ...validStable, maxDrift: bad } })],
+          }).errors.some((e) => e.field === 'maxDrift'),
+          `maxDrift=${String(bad)}`,
+        ).toBe(true);
+      }
+    });
+
+    it('策略多项非法时错误全部并入该步骤错误清单并保持检出顺序', () => {
+      const { errors } = validateRecipe({
+        steps: [
+          step({ stable: { samples: 2, maxRangeMg: -1, maxDrift: 1.5 } }),
+          step({ id: 'B' }),
+        ],
+      });
+      expect(errors.map((e) => `${e.stepIndex}:${e.field}`)).toEqual([
+        '0:samples',
+        '0:maxRangeMg',
+        '0:maxDrift',
+      ]);
+    });
+
+    it('步骤其他字段非法时稳定策略不被写入该步骤', () => {
+      const { recipe, errors } = validateRecipe({
+        steps: [step({ id: '', stable: validStable })],
+      });
+      expect(recipe).toBeNull();
+      expect(errors.map((e) => e.field)).toEqual(['id']);
+    });
   });
 });

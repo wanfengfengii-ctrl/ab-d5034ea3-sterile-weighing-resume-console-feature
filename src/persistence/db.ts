@@ -19,6 +19,12 @@ export interface PrepareRecord {
   seq: number;
   stepId: string;
   doseMg: number;
+  /**
+   * 稳定读数步骤的证据：确认所用的最后 N 项读数（录入顺序，x = 0…N−1），
+   * 与 doseMg（由该证据重算出的候选剂量）保持一致；
+   * 旧配方的单次称量步骤无此字段，恢复历史数据时按 undefined 处理。
+   */
+  stableReadings?: number[];
 }
 
 /** 提交标记：仅有序号；存在即表示对应预备记录已生效。 */

@@ -249,3 +249,82 @@ form button {
 .crash-banner h2 {
   color: var(--danger);
 }
+
+.stable-window {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.stable-readings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  margin: 6px 0 12px;
+  padding: 0;
+}
+
+.stable-readings li {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  min-width: 72px;
+  text-align: center;
+}
+
+.stable-readings .reading-index {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.stable-readings .reading-value {
+  display: block;
+  font-weight: 600;
+}
+
+.stable-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.stable-stats div {
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.stable-stats dt {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.stable-stats dd {
+  margin: 2px 0 0;
+  font-weight: 600;
+}
+
+.stable-stats .stat-ok {
+  background: var(--ok-bg);
+}
+
+.stable-stats .stat-fail {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.errors-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.errors-list .error {
+  margin: 0;
+}
